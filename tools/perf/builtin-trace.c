@@ -19,6 +19,7 @@
 #ifdef HAVE_LIBBPF_SUPPORT
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
+#include <bpf/btf.h>
 #ifdef HAVE_BPF_SKEL
 #include "bpf_skel/augmented_raw_syscalls.skel.h"
 #endif
@@ -110,6 +111,13 @@ struct syscall_arg_fmt {
 	const char *name;
 	u16	   nr_entries; // for arrays
 	bool	   show_zero;
+#ifdef HAVE_LIBBPF_SUPPORT
+	bool	   is_enum;
+	struct {
+		void	*entries;
+		u16	nr_entries;
+	}	   btf_entry;
+#endif
 };
 
 struct syscall_fmt {
@@ -139,6 +147,9 @@ struct trace {
 	} syscalls;
 #ifdef HAVE_BPF_SKEL
 	struct augmented_raw_syscalls_bpf *skel;
+#endif
+#ifdef HAVE_LIBBPF_SUPPORT
+	struct btf		*btf;
 #endif
 	struct record_opts	opts;
 	struct evlist	*evlist;
@@ -896,6 +907,112 @@ static size_t syscall_arg__scnprintf_getrandom_flags(char *bf, size_t size,
 	  { .scnprintf	= SCA_STRARRAY_FLAGS, \
 	    .strtoul	= STUL_STRARRAY_FLAGS, \
 	    .parm	= &strarray__##array, }
+
+#ifdef HAVE_LIBBPF_SUPPORT
+static const struct btf_type *btf_find_type(struct btf *btf, char *type)
+{
+	const struct btf_type *bt;
+	int id = btf__find_by_name(btf, type);
+
+	if (id < 0)
+		return NULL;
+
+	bt = btf__type_by_id(btf, id);
+	if (bt == NULL) {
+		pr_debug("Couldn't find btf_type yet id %d is present in BTF\n", id);
+		return NULL;
+	}
+
+	return bt;
+}
+
+struct btf_parm {
+	struct btf *btf;
+	char *type;
+};
+
+static bool syscall_arg__strtoul_btf_enum(char *bf, size_t size, struct syscall_arg *arg, u64 *val)
+{
+	struct btf_parm *bparm = arg->parm;
+	struct btf *btf = bparm->btf;
+	char *type      = bparm->type;
+	char enum_prefix[][16] = { "enum", "const enum" }, *ep;
+	const struct btf_type *bt;
+	struct btf_enum *be;
+
+	if (btf == NULL)
+		return false;
+
+	for (size_t i = 0; i < ARRAY_SIZE(enum_prefix); i++) {
+		ep = enum_prefix[i];
+		if (strstarts(type, ep))
+			type += strlen(ep) + 1;
+	}
+
+	bt = btf_find_type(btf, type);
+	if (bt == NULL)
+		return false;
+
+	be = btf_enum(bt);
+
+	for (int i = 0; i < btf_vlen(bt); ++i, ++be) {
+		const char *name = btf__name_by_offset(btf, be->name_off);
+		int max_len = max(size, strlen(name));
+
+		if (strncmp(name, bf, max_len) == 0) {
+			*val = be->val;
+			return true;
+		}
+	}
+
+	return false;
+}
+
+#define STUL_BTF_ENUM syscall_arg__strtoul_btf_enum
+
+static int btf_enum_find_entry(struct btf *btf, char *type, struct syscall_arg_fmt *arg_fmt)
+{
+	char enum_prefix[][16] = { "enum", "const enum" }, *ep;
+	const struct btf_type *bt;
+
+	for (size_t i = 0; i < ARRAY_SIZE(enum_prefix); i++) {
+		ep = enum_prefix[i];
+		if (strstarts(type, ep))
+			type += strlen(ep) + 1;
+	}
+
+	bt = btf_find_type(btf, type);
+	if (bt == NULL)
+		return -1;
+
+	arg_fmt->btf_entry.entries    = btf_enum(bt);
+	arg_fmt->btf_entry.nr_entries = btf_vlen(bt);
+
+	return 0;
+}
+
+static size_t btf_enum_scnprintf(char *bf, size_t size, int val, struct btf *btf, char *type,
+				 struct syscall_arg_fmt *arg_fmt)
+{
+	struct btf_enum *be;
+
+	/* if btf_entry is NULL, find and save it to arg_fmt */
+	if (arg_fmt->btf_entry.entries == NULL)
+		if (btf_enum_find_entry(btf, type, arg_fmt))
+			return 0;
+
+	be = arg_fmt->btf_entry.entries;
+
+	for (int i = 0; i < arg_fmt->btf_entry.nr_entries; ++i, ++be) {
+		if (be->val == val) {
+			return scnprintf(bf, size, "%s",
+					 btf__name_by_offset(btf, be->name_off));
+		}
+	}
+
+	return 0;
+}
+#endif
 
 #include "trace/beauty/arch_errno_names.c"
 #include "trace/beauty/eventfd.c"
@@ -1699,6 +1816,22 @@ static void trace__symbols__exit(struct trace *trace)
 	symbol__exit();
 }
 
+#ifdef HAVE_LIBBPF_SUPPORT
+static int trace__load_vmlinux_btf(struct trace *trace)
+{
+	trace->btf = btf__load_vmlinux_btf();
+	if (verbose > 0) {
+		fprintf(trace->output, trace->btf ? "vmlinux BTF loaded\n" :
+						    "Failed to load vmlinux BTF\n");
+	}
+
+	if (trace->btf == NULL)
+		return -1;
+
+	return 0;
+}
+#endif
+
 static int syscall__alloc_arg_fmts(struct syscall *sc, int nr_args)
 {
 	int idx;
@@ -1782,6 +1915,11 @@ syscall_arg_fmt__init_array(struct syscall_arg_fmt *arg, struct tep_format_field
 			 * 7 unsigned long
 			 */
 			arg->scnprintf = SCA_FD;
+#ifdef HAVE_LIBBPF_SUPPORT
+		} else if (strstr(field->type, "enum")) {
+			arg->is_enum = true;
+			arg->strtoul = STUL_BTF_ENUM;
+#endif
 		} else {
 			const struct syscall_arg_fmt *fmt =
 				syscall_arg_fmt__find_by_name(field->name);
@@ -2096,12 +2234,34 @@ static size_t syscall__scnprintf_args(struct syscall *sc, char *bf, size_t size,
 			 */
 			if (val == 0 && !trace->show_zeros &&
 			    !(sc->arg_fmt && sc->arg_fmt[arg.idx].show_zero))
+#ifdef HAVE_LIBBPF_SUPPORT
+				if (!(sc->arg_fmt && sc->arg_fmt[arg.idx].is_enum))
+#endif
 				continue;
 
 			printed += scnprintf(bf + printed, size - printed, "%s", printed ? ", " : "");
 
 			if (trace->show_arg_names)
 				printed += scnprintf(bf + printed, size - printed, "%s: ", field->name);
+
+#ifdef HAVE_LIBBPF_SUPPORT
+			if (sc->arg_fmt[arg.idx].is_enum) {
+				size_t p;
+
+				if (trace->btf == NULL && trace__load_vmlinux_btf(trace))
+					goto out_unaugmented;
+
+				p = btf_enum_scnprintf(bf + printed, size - printed, val,
+							      trace->btf, field->type,
+							      &sc->arg_fmt[arg.idx]);
+				if (p == 0)
+					goto out_unaugmented;
+
+				printed += p;
+				continue;
+			}
+out_unaugmented:
+#endif
 
 			printed += syscall_arg_fmt__scnprintf_val(&sc->arg_fmt[arg.idx],
 								  bf + printed, size - printed, &arg, val);
@@ -2792,6 +2952,9 @@ static size_t trace__fprintf_tp_fields(struct trace *trace, struct evsel *evsel,
 
 		/* Suppress this argument if its value is zero and show_zero property isn't set. */
 		if (val == 0 && !trace->show_zeros && !arg->show_zero)
+#ifdef HAVE_LIBBPF_SUPPORT
+			if (!arg->is_enum)
+#endif
 			continue;
 
 		printed += scnprintf(bf + printed, size - printed, "%s", printed ? ", " : "");
@@ -2799,6 +2962,23 @@ static size_t trace__fprintf_tp_fields(struct trace *trace, struct evsel *evsel,
 		if (trace->show_arg_names)
 			printed += scnprintf(bf + printed, size - printed, "%s: ", field->name);
 
+#ifdef HAVE_LIBBPF_SUPPORT
+		if (arg->is_enum) {
+			size_t p;
+
+			if (trace->btf == NULL && trace__load_vmlinux_btf(trace))
+				goto out_unaugmented;
+
+			p = btf_enum_scnprintf(bf + printed, size - printed, val, trace->btf,
+						      field->type, arg);
+			if (p == 0)
+				goto out_unaugmented;
+
+			printed += p;
+			continue;
+		}
+out_unaugmented:
+#endif
 		printed += syscall_arg_fmt__scnprintf_val(arg, bf + printed, size - printed, &syscall_arg, val);
 	}
 
@@ -3354,8 +3534,6 @@ static int trace__bpf_prog_sys_exit_fd(struct trace *trace, int id)
 static struct bpf_program *trace__find_usable_bpf_prog_entry(struct trace *trace, struct syscall *sc)
 {
 	struct tep_format_field *field, *candidate_field;
-	int id;
-
 	/*
 	 * We're only interested in syscalls that have a pointer:
 	 */
@@ -3367,7 +3545,8 @@ static struct bpf_program *trace__find_usable_bpf_prog_entry(struct trace *trace
 	return NULL;
 
 try_to_find_pair:
-	for (id = 0; id < trace->sctbl->syscalls.nr_entries; ++id) {
+	for (int i = 0; i < trace->sctbl->syscalls.nr_entries; ++i) {
+		int id = syscalltbl__id_at_idx(trace->sctbl, i);
 		struct syscall *pair = trace__syscall_info(trace, NULL, id);
 		struct bpf_program *pair_prog;
 		bool is_candidate = false;
@@ -3456,10 +3635,10 @@ static int trace__init_syscalls_bpf_prog_array_maps(struct trace *trace)
 {
 	int map_enter_fd = bpf_map__fd(trace->skel->maps.syscalls_sys_enter);
 	int map_exit_fd  = bpf_map__fd(trace->skel->maps.syscalls_sys_exit);
-	int err = 0, key;
+	int err = 0;
 
-	for (key = 0; key < trace->sctbl->syscalls.nr_entries; ++key) {
-		int prog_fd;
+	for (int i = 0; i < trace->sctbl->syscalls.nr_entries; ++i) {
+		int prog_fd, key = syscalltbl__id_at_idx(trace->sctbl, i);
 
 		if (!trace__syscall_enabled(trace, key))
 			continue;
@@ -3505,7 +3684,8 @@ static int trace__init_syscalls_bpf_prog_array_maps(struct trace *trace)
 	 * first and second arg (this one on the raw_syscalls:sys_exit prog
 	 * array tail call, then that one will be used.
 	 */
-	for (key = 0; key < trace->sctbl->syscalls.nr_entries; ++key) {
+	for (int i = 0; i < trace->sctbl->syscalls.nr_entries; ++i) {
+		int key = syscalltbl__id_at_idx(trace->sctbl, i);
 		struct syscall *sc = trace__syscall_info(trace, NULL, key);
 		struct bpf_program *pair_prog;
 		int prog_fd;
@@ -3680,7 +3860,8 @@ static int ordered_events__deliver_event(struct ordered_events *oe,
 	return __trace__deliver_event(trace, event->event);
 }
 
-static struct syscall_arg_fmt *evsel__find_syscall_arg_fmt_by_name(struct evsel *evsel, char *arg)
+static struct syscall_arg_fmt *evsel__find_syscall_arg_fmt_by_name(struct evsel *evsel, char *arg,
+								   char **type)
 {
 	struct tep_format_field *field;
 	struct syscall_arg_fmt *fmt = __evsel__syscall_arg_fmt(evsel);
@@ -3689,8 +3870,10 @@ static struct syscall_arg_fmt *evsel__find_syscall_arg_fmt_by_name(struct evsel 
 		return NULL;
 
 	for (field = evsel->tp_format->format.fields; field; field = field->next, ++fmt)
-		if (strcmp(field->name, arg) == 0)
+		if (strcmp(field->name, arg) == 0) {
+			*type = field->type;
 			return fmt;
+		}
 
 	return NULL;
 }
@@ -3728,14 +3911,14 @@ static int trace__expand_filter(struct trace *trace __maybe_unused, struct evsel
 			struct syscall_arg_fmt *fmt;
 			int left_size = tok - left,
 			    right_size = right_end - right;
-			char arg[128];
+			char arg[128], *type;
 
 			while (isspace(left[left_size - 1]))
 				--left_size;
 
 			scnprintf(arg, sizeof(arg), "%.*s", left_size, left);
 
-			fmt = evsel__find_syscall_arg_fmt_by_name(evsel, arg);
+			fmt = evsel__find_syscall_arg_fmt_by_name(evsel, arg, &type);
 			if (fmt == NULL) {
 				pr_err("\"%s\" not found in \"%s\", can't set filter \"%s\"\n",
 				       arg, evsel->name, evsel->filter);
@@ -3750,7 +3933,19 @@ static int trace__expand_filter(struct trace *trace __maybe_unused, struct evsel
 				struct syscall_arg syscall_arg = {
 					.parm = fmt->parm,
 				};
+#ifdef HAVE_LIBBPF_SUPPORT
+				struct btf_parm bparm;
 
+				if (fmt->is_enum) {
+					if (trace->btf == NULL)
+						trace__load_vmlinux_btf(trace);
+
+					/* btf could be NULL */
+					bparm.btf  = trace->btf;
+					bparm.type = type;
+					syscall_arg.parm = &bparm;
+				}
+#endif
 				if (fmt->strtoul(right, right_size, &syscall_arg, &val)) {
 					char *n, expansion[19];
 					int expansion_lenght = scnprintf(expansion, sizeof(expansion), "%#" PRIx64, val);
