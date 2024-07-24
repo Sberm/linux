@@ -298,6 +298,7 @@ void evsel__init(struct evsel *evsel,
 	evsel->pmu_name      = NULL;
 	evsel->group_pmu_name = NULL;
 	evsel->skippable     = false;
+	evsel->sample_type_embed = 0;
 }
 
 struct evsel *evsel__new_idx(struct perf_event_attr *attr, int idx)
@@ -440,6 +441,7 @@ struct evsel *evsel__clone(struct evsel *orig)
 	evsel->weak_group = orig->weak_group;
 	evsel->use_config_name = orig->use_config_name;
 	evsel->pmu = orig->pmu;
+	evsel->sample_type_embed = orig->sample_type_embed;
 
 	if (evsel__copy_config_terms(evsel, orig) < 0)
 		goto out_err;
@@ -2282,6 +2284,10 @@ retry_open:
 
 			test_attr__ready();
 
+			/* BPF output event can only be system-wide, off-cpu filters tasks in BPF */
+			if (evsel__is_bpf_output(evsel))
+				pid = -1;
+
 			/* Debug message used by test scripts */
 			pr_debug2_peo("sys_perf_event_open: pid %d  cpu %d  group_fd %d  flags %#lx",
 				pid, perf_cpu_map__cpu(cpus, idx).cpu, group_fd, evsel->open_flags);
@@ -2581,7 +2587,7 @@ int evsel__parse_sample(struct evsel *evsel, union perf_event *event,
 {
 	u64 type = evsel->core.attr.sample_type;
 	bool swapped = evsel->needs_swap;
-	const __u64 *array;
+	const __u64 *array, *tmp = NULL;
 	u16 max_size = event->header.size;
 	const void *endp = (void *)event + max_size;
 	u64 sz;
@@ -2591,6 +2597,11 @@ int evsel__parse_sample(struct evsel *evsel, union perf_event *event,
 	 * for why this goofiness is needed.
 	 */
 	union u64_swap u;
+
+	if (evsel__has_embed(evsel) && evsel__is_bpf_output(evsel) && data->raw_data) {
+		tmp = data->raw_data;
+		type = evsel->sample_type_embed;
+	}
 
 	memset(data, 0, sizeof(*data));
 	data->cpu = data->pid = data->tid = -1;
@@ -2607,10 +2618,13 @@ int evsel__parse_sample(struct evsel *evsel, union perf_event *event,
 		return perf_evsel__parse_id_sample(evsel, event, data);
 	}
 
-	array = event->sample.array;
-
 	if (perf_event__check_size(event, evsel->sample_size))
 		return -EFAULT;
+
+	array = event->sample.array;
+
+	if (evsel__is_bpf_output(evsel) && tmp)
+		array = tmp;
 
 	if (type & PERF_SAMPLE_IDENTIFIER) {
 		data->id = *array;
@@ -2657,7 +2671,6 @@ int evsel__parse_sample(struct evsel *evsel, union perf_event *event,
 	}
 
 	if (type & PERF_SAMPLE_CPU) {
-
 		u.val64 = *array;
 		if (swapped) {
 			/* undo swap of u64, then swap on individual u32s */
